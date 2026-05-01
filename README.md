@@ -17,6 +17,43 @@ It's designed to be pointed at a directory of PDFs and run unattended overnight:
 - **Idempotent caching.** A successful conversion is cached by `<stem>.md.mtime > <pdf>.mtime`; re-running the same batch is a near-no-op.
 - **Encryption fast-fail.** Password-protected PDFs surface as "encrypted: password required" instead of misleading downstream emptiness errors.
 
+## Requirements
+
+**OS:** Linux, macOS, and Windows are all supported. The pipeline branches on
+`sys.platform` for the output-dir lockfile (`fcntl` on POSIX, `msvcrt` on
+Windows) and uses portable Ghostscript discovery (`gs` / `gswin64c` /
+`gswin32c`). The `alchemd.bat.template` wrapper is a Windows convenience
+only — POSIX users can write a tiny shell wrapper or just call
+`python -m alchemd` directly.
+
+**Python:** 3.10 or newer.
+
+**GPU (recommended):** an NVIDIA GPU with CUDA. The pipeline is tuned for
+~16 GB VRAM (RTX 4070-class) but the docling batch-size pin lets it run on
+smaller cards. Without CUDA, the engines fall back to CPU and the adaptive
+timeout auto-scales 6× — slow but functional (the test suite covers this
+path).
+
+**RAM:** 8 GB minimum, 16+ GB recommended. The subprocess-per-engine
+isolation means one engine's models can hit 6 GB RSS on its own.
+
+**Disk:** budget for the engines' caches and scratch:
+- `HF_HOME` — 3 to 10 GB for marker / docling / mineru model weights.
+- `TEMP` / `TMP` / `TMPDIR` — multi-GB scratch for Surya/marker on long books.
+- Output — small (`<stem>.md` + manifest + extracted images per PDF).
+
+Point `HF_HOME` and `TEMP` at a non-system drive when working with large
+books or when the system drive is small.
+
+**External tools:**
+- [Ghostscript](https://www.ghostscript.com/) on `PATH` (sanitize tier).
+  - Linux: `apt-get install ghostscript`
+  - macOS: `brew install ghostscript`
+  - Windows: `winget install ArtifexSoftware.GhostScript`
+- The mineru engine is optional and only used when the input pdf is
+  classified as scanned. If `mineru` is not on `PATH` it's auto-skipped
+  with a warning — no error.
+
 ## Install
 
 ```
