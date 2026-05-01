@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alchemd"
+version = "1.0.0"
+description = "Turn any pile of PDFs into perfect markdown — multi-engine pipeline (marker / docling / mineru) with auto-routing, auto-slicing, and CUDA-poisoning safeguards."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+  { name = "jw2142-rmd", email = "dan.wellington@gmail.com" },
+]
+keywords = ["pdf", "markdown", "ocr", "marker", "docling", "mineru", "conversion", "academic-papers"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Text Processing :: Markup :: Markdown",
+  "Topic :: Scientific/Engineering",
+]
+dependencies = [
+  # Engines (each is exercised; mineru is auto-skipped when its CLI isn't on PATH).
+  "marker-pdf>=1.10",
+  "docling>=2.90",
+  # PDF probing / sanitize tier
+  "pypdfium2>=4.30",
+  "pikepdf>=10.5",
+  "pdfplumber>=0.11",
+  "pypdf>=6.0",
+]
+
+[project.optional-dependencies]
+mineru = ["mineru>=3.0"]
+test = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+alchemd = "alchemd.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/jw2142-rmd/alchemd"
+Repository = "https://github.com/jw2142-rmd/alchemd"
+Issues = "https://github.com/jw2142-rmd/alchemd/issues"
+
+[tool.setuptools.packages.find]
+include = ["alchemd*"]
+exclude = ["tests*", "scripts*", "docs*"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]

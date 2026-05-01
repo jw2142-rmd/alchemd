@@ -1,0 +1,32 @@
+@echo off
+rem Windows wrapper for alchemd — copy to alchemd.bat and edit the
+rem paths for your machine. Required because the engines (marker, docling,
+rem mineru) drop multi-GB scratch into TEMP and tens of GB of model
+rem weights into HF_HOME, both of which fill C: drives quickly.
+
+rem ==== EDIT THESE FOR YOUR MACHINE =========================================
+set ALCHEMD_REPO=C:\path\to\alchemd
+set ALCHEMD_VENV=%ALCHEMD_REPO%\.venv
+set ALCHEMD_INPUT=%ALCHEMD_REPO%\input
+set ALCHEMD_OUTPUT=%ALCHEMD_REPO%\output
+set TEMP=%ALCHEMD_REPO%\.temp
+set TMP=%ALCHEMD_REPO%\.temp
+set TMPDIR=%ALCHEMD_REPO%\.temp
+set HF_HOME=%ALCHEMD_REPO%\.hf_cache
+rem ==========================================================================
+
+cd /d %ALCHEMD_REPO%
+set PATH=%ALCHEMD_VENV%\Scripts;%PATH%
+
+if not exist %TEMP% mkdir %TEMP%
+if not exist %ALCHEMD_OUTPUT% mkdir %ALCHEMD_OUTPUT%
+
+%ALCHEMD_VENV%\Scripts\python.exe -m alchemd ^
+    --input-dir %ALCHEMD_INPUT% ^
+    --output-dir %ALCHEMD_OUTPUT% ^
+    -y > %ALCHEMD_OUTPUT%\overnight_stdout.log 2>&1
+
+rem Propagate the python exit code so wrappers (Task Scheduler, etc.) can
+rem distinguish 0=ok, 2=per-PDF failures, 3=cuda_aborted (reboot required),
+rem 4=output-dir locked, 5=disk-error.
+exit /b %ERRORLEVEL%
