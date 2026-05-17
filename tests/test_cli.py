@@ -151,8 +151,10 @@ def test_gpu_health_probe_raises_on_cuda_failure(monkeypatch):
 def test_main_aborts_batch_with_exit_3_on_in_process_cuda_poisoned(
         monkeypatch, tmp_path, capsys):
     """End-to-end regression: a CudaPoisonedError raised by the in-process
-    path must abort the rest of the batch and return exit code 3 (distinct
-    from 0=ok, 1=arg error, 2=per-PDF failures)."""
+    path under --no-cpu-fallback must abort the rest of the batch and return
+    exit code 3 (distinct from 0=ok, 1=arg error, 2=per-PDF failures).
+    The default mode now CPU-retries instead — see
+    test_main_cpu_fallback_recovers_cuda_poisoned_in_process below."""
     input_dir = tmp_path / "in"
     input_dir.mkdir()
     a = input_dir / "a.pdf"
@@ -182,6 +184,7 @@ def test_main_aborts_batch_with_exit_3_on_in_process_cuda_poisoned(
          "--output-dir", str(out),
          "--in-process",
          "--no-auto-slice",
+         "--no-cpu-fallback",
          "-y"])
 
     rc = cli.main()
@@ -194,13 +197,68 @@ def test_main_aborts_batch_with_exit_3_on_in_process_cuda_poisoned(
     assert "cuda_poisoned" in run_log
 
 
+def test_main_cpu_fallback_recovers_cuda_poisoned_in_process(
+        monkeypatch, tmp_path):
+    """Default mode: in-process CudaPoisonedError engages CPU fallback,
+    retries the failing PDF, and continues the batch. args.cpu flips True
+    so subsequent PDFs spawn with the GPU hidden via CUDA_VISIBLE_DEVICES=-1.
+    """
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    a = input_dir / "a.pdf"
+    b = input_dir / "b.pdf"
+    a.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    b.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    out = tmp_path / "out"
+
+    monkeypatch.setattr(cli.env, "check", lambda venv, auto_yes: None)
+    monkeypatch.setattr(cli, "_gpu_health_probe", lambda: None)
+
+    calls: list[tuple[str, bool]] = []
+
+    def fake_in_process(pdf, out_dir, args, engines=None):
+        calls.append((pdf.name, args.cpu))
+        # First call (GPU mode) on a.pdf poisons; every subsequent call
+        # (CPU mode) succeeds.
+        if len(calls) == 1:
+            raise cli.CudaPoisonedError(
+                "GPU CUDA context poisoned (driver in dead state)")
+        # Write a fake md so chunking has something to chunk.
+        stem_dir = out_dir / pdf.stem
+        stem_dir.mkdir(parents=True, exist_ok=True)
+        (stem_dir / f"{pdf.stem}.md").write_text("# ok\n", encoding="utf-8")
+        (stem_dir / "manifest.json").write_text("{}", encoding="utf-8")
+        return (True, "marker", 1.0, 0.1)
+
+    monkeypatch.setattr(cli, "_process_one_in_process", fake_in_process)
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["alchemd",
+         "--input-dir", str(input_dir),
+         "--output-dir", str(out),
+         "--in-process",
+         "--no-auto-slice",
+         "-y"])
+
+    rc = cli.main()
+    # Exit 0: a.pdf failed once but the CPU retry recovered, b.pdf ran on CPU.
+    assert rc == 0, f"expected exit 0 after CPU recovery, got {rc}"
+    # Calls: a.pdf GPU (poisoned) → a.pdf CPU (ok) → b.pdf CPU (ok)
+    assert calls == [
+        ("a.pdf", False),
+        ("a.pdf", True),
+        ("b.pdf", True),
+    ], f"unexpected call sequence: {calls}"
+
+
 def test_main_aborts_batch_with_exit_3_via_subprocess_debug_log_scrape(
         monkeypatch, tmp_path):
-    """Regression for the subprocess-isolation path: when each PDF runs in
-    a child interpreter, CudaPoisonedError can't propagate by exception —
+    """Subprocess-isolation path with --no-cpu-fallback: when each PDF runs
+    in a child interpreter, CudaPoisonedError can't propagate by exception —
     the main loop must scrape debug.log for the cuda_poisoned reason and
-    abort. This is the path that actually fires in production batch runs
-    (batch_isolated=True is the default)."""
+    abort. Default mode now CPU-retries instead — covered by
+    test_main_cpu_fallback_recovers_subprocess_cuda_poisoned below."""
     input_dir = tmp_path / "in"
     input_dir.mkdir()
     a = input_dir / "a.pdf"
@@ -236,6 +294,7 @@ def test_main_aborts_batch_with_exit_3_via_subprocess_debug_log_scrape(
          "--input-dir", str(input_dir),
          "--output-dir", str(out),
          "--no-auto-slice",
+         "--no-cpu-fallback",
          "-y"])
 
     rc = cli.main()
@@ -243,6 +302,59 @@ def test_main_aborts_batch_with_exit_3_via_subprocess_debug_log_scrape(
     assert processed == ["a.pdf"], (
         f"subprocess path must abort after detecting cuda_poisoned in "
         f"debug.log; got {processed}")
+
+
+def test_main_cpu_fallback_recovers_subprocess_cuda_poisoned(
+        monkeypatch, tmp_path):
+    """Default subprocess path: on cuda_poisoned in debug.log, engage CPU
+    fallback, retry the same PDF (subprocess inherits --cpu), then continue
+    with subsequent PDFs in CPU mode."""
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    a = input_dir / "a.pdf"
+    b = input_dir / "b.pdf"
+    a.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    b.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    out = tmp_path / "out"
+
+    monkeypatch.setattr(cli.env, "check", lambda venv, auto_yes: None)
+    monkeypatch.setattr(cli, "_gpu_health_probe", lambda: None)
+
+    calls: list[tuple[str, bool]] = []
+
+    def fake_subprocess(pdf, out_dir, args, input_dir_override=None):
+        calls.append((pdf.name, args.cpu))
+        stem_dir = out_dir / pdf.stem
+        stem_dir.mkdir(parents=True, exist_ok=True)
+        if len(calls) == 1:
+            (stem_dir / "debug.log").write_text(
+                "[2026-04-30 12:00:00] === done ===\n"
+                "[2026-04-30 12:00:00] status=failed "
+                "reason=cuda_poisoned: GPU CUDA context poisoned\n",
+                encoding="utf-8")
+            return (False, "", 0.0, 0.0)
+        (stem_dir / f"{pdf.stem}.md").write_text("# ok\n", encoding="utf-8")
+        (stem_dir / "manifest.json").write_text(
+            '{"engine":"marker","quality_score":1.0}', encoding="utf-8")
+        return (True, "marker", 1.0, 0.1)
+
+    monkeypatch.setattr(cli, "_process_one_subprocess", fake_subprocess)
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["alchemd",
+         "--input-dir", str(input_dir),
+         "--output-dir", str(out),
+         "--no-auto-slice",
+         "-y"])
+
+    rc = cli.main()
+    assert rc == 0, f"expected exit 0 after CPU recovery, got {rc}"
+    assert calls == [
+        ("a.pdf", False),
+        ("a.pdf", True),
+        ("b.pdf", True),
+    ], f"unexpected call sequence: {calls}"
 
 
 def test_find_existing_output_detects_newer_md(tmp_path):

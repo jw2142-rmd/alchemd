@@ -206,10 +206,24 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"disable auto-slicing of PDFs over "
                         f"{LARGE_PDF_PAGE_THRESHOLD} pages (use the manual "
                         f"slice_pdf + merge_marker_parts flow instead)")
+    p.add_argument("--cpu", action="store_true",
+                   help="force every engine onto CPU from the start (hides "
+                        "the GPU via CUDA_VISIBLE_DEVICES=-1 in the child "
+                        f"env). Slow but immune to CUDA poisoning. Adaptive "
+                        f"timeout auto-scales {6}x.")
+    p.add_argument("--no-cpu-fallback", action="store_true",
+                   help="disable the automatic CPU fallback that activates "
+                        "after a cuda_poisoned detection or a low-VRAM probe. "
+                        "With this flag, cuda_poisoned aborts the batch "
+                        "with exit 3 (the pre-2026-05 behavior).")
+    p.add_argument("--vram-headroom-gib", type=float, default=3.0,
+                   help="minimum free VRAM (GiB) probed before each PDF. "
+                        "Below this, the PDF runs on CPU. Set to 0 to disable "
+                        "the probe.")
     return p
 
 
-def _build_engines() -> dict[str, object]:
+def _build_engines(force_cpu: bool = False) -> dict[str, object]:
     """All engines run via SubprocessEngine: each loads in a fresh interpreter,
     so a failed engine's multi-GB model cache and CUDA state release before the
     next engine starts. Without this, attempts stack in RAM (10+ GB observed on
@@ -222,14 +236,47 @@ def _build_engines() -> dict[str, object]:
     just adds a guaranteed failure to the fallback chain (observed in the
     2026-04-28 v2 batch where every PDF ended with a misleading
     `[mineru:resolve]` reason after the real failure earlier in the chain).
+
+    force_cpu propagates from --cpu / the runtime CPU-fallback path to every
+    engine instance. The cli can also flip the attribute on existing
+    instances mid-batch when a poison event is detected.
     """
     engines: dict[str, object] = {
-        "marker": SubprocessEngine("marker"),
-        "docling": SubprocessEngine("docling"),
+        "marker": SubprocessEngine("marker", force_cpu=force_cpu),
+        "docling": SubprocessEngine("docling", force_cpu=force_cpu),
     }
     if shutil.which("mineru") is not None:
-        engines["mineru"] = SubprocessEngine("mineru")
+        engines["mineru"] = SubprocessEngine("mineru", force_cpu=force_cpu)
     return engines
+
+
+def _vram_free_gib() -> float | None:
+    """Return free GPU memory in GiB on device 0. None when torch / CUDA
+    are unavailable, or when the probe itself errors (treated as 'cannot
+    tell', not 'no headroom' — fall back to GPU path)."""
+    try:
+        import torch
+    except ImportError:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    try:
+        free_bytes, _total = torch.cuda.mem_get_info()
+        return free_bytes / (1024 ** 3)
+    except Exception:
+        return None
+
+
+def _flip_engines_to_cpu(engines: dict[str, object] | None) -> None:
+    """Set force_cpu=True on every SubprocessEngine instance the cli holds.
+    Subprocess-batch mode reuses argv-passed flags (so children get --cpu
+    via _process_one_subprocess) but the in-process batch / single-PDF
+    paths share a registry that needs the live flip."""
+    if not engines:
+        return
+    for eng in engines.values():
+        if hasattr(eng, "force_cpu"):
+            eng.force_cpu = True
 
 
 def _router_override(engine: str) -> router.RouterConfig | None:
@@ -329,6 +376,12 @@ def _process_one_subprocess(pdf_path: Path, output_dir: Path, args,
         cmd.append("--no-sanitize")
     if args.keep_temp:
         cmd.append("--keep-temp")
+    if args.cpu:
+        cmd.append("--cpu")
+    if args.no_cpu_fallback:
+        cmd.append("--no-cpu-fallback")
+    if args.vram_headroom_gib != 3.0:
+        cmd.extend(["--vram-headroom-gib", str(args.vram_headroom_gib)])
 
     # The parent holds <output_dir>/.cli.lock. Tell the child to skip the
     # lock acquire so it doesn't deadlock the batch on its own parent
@@ -543,12 +596,22 @@ def _run_batch(args, input_dir: Path, output_dir: Path, venv: Path) -> int:
     batch_t0 = time.time()
 
     all_chunks: list[dict] = []
-    in_process_engines: dict[str, object] | None = None if batch_isolated else _build_engines()
+    in_process_engines: dict[str, object] | None = (
+        None if batch_isolated else _build_engines(force_cpu=args.cpu))
 
     any_failed = False
 
     cuda_aborted = False
     disk_error_seen = False
+    # Runtime CPU-fallback state. Flips True after either:
+    #   - a cuda_poisoned EngineError surfaces, or
+    #   - a VRAM headroom probe returns < args.vram_headroom_gib.
+    # Once true, every subsequent per-PDF spawn carries --cpu (subprocess
+    # mode) or has its engine registry flipped to force_cpu (in-process).
+    # Stays true for the rest of the batch — a single poison incident is
+    # treated as proof the driver state is now unreliable host-wide.
+    cpu_fallback_active = bool(args.cpu)
+    cpu_fallback_just_engaged = False
 
     # Per-PDF status records for the end-of-batch summary (Phase-1 finding F14).
     # Each: {"name": str, "status": str, "engine": str, "elapsed": float}
@@ -583,19 +646,45 @@ def _run_batch(args, input_dir: Path, output_dir: Path, venv: Path) -> int:
                 print()
                 continue
 
-        # GPU health probe runs BEFORE we spend minutes on a per-PDF
-        # subprocess. A poisoned driver from a prior PDF (or another job
-        # on the box) would make every engine attempt a 4-hour timeout
-        # waste. <1 s when healthy.
-        try:
-            _gpu_health_probe()
-        except CudaPoisonedError as exc:
-            ui.err(f"aborting batch: {exc}")
-            run_log_lines.append(
-                f"{pdf_path.name}\tABORTED\treason=cuda_poisoned (probe): {exc}")
-            cuda_aborted = True
-            any_failed = True
-            break
+        # Pre-PDF GPU health probe. A poisoned driver from a prior PDF (or
+        # another job on the box) would make every engine attempt a 4-hour
+        # timeout waste. <1 s when healthy.
+        if not cpu_fallback_active:
+            try:
+                _gpu_health_probe()
+            except CudaPoisonedError as exc:
+                if args.no_cpu_fallback:
+                    ui.err(f"aborting batch: {exc}")
+                    run_log_lines.append(
+                        f"{pdf_path.name}\tABORTED\treason=cuda_poisoned (probe): {exc}")
+                    cuda_aborted = True
+                    any_failed = True
+                    break
+                ui.warn(f"GPU health probe failed: {exc}")
+                ui.warn("CPU fallback engaged for the rest of this batch.")
+                cpu_fallback_active = True
+                cpu_fallback_just_engaged = True
+                _flip_engines_to_cpu(in_process_engines)
+
+        # VRAM headroom guard. Below threshold, run THIS PDF on CPU even
+        # if no poison has been detected yet — most fragmentation OOMs
+        # happen when free VRAM looks high but is too small a contiguous
+        # block. Threshold default 3 GiB covers docling+marker comfortably;
+        # 0 disables.
+        if (not cpu_fallback_active
+                and args.vram_headroom_gib > 0):
+            free_gib = _vram_free_gib()
+            if free_gib is not None and free_gib < args.vram_headroom_gib:
+                ui.warn(f"VRAM headroom low ({free_gib:.2f} GiB free < "
+                        f"{args.vram_headroom_gib:.2f} GiB threshold). "
+                        f"CPU fallback engaged for the rest of this batch.")
+                cpu_fallback_active = True
+                cpu_fallback_just_engaged = True
+                _flip_engines_to_cpu(in_process_engines)
+
+        if cpu_fallback_just_engaged:
+            args.cpu = True  # so _process_one_subprocess passes --cpu down
+            cpu_fallback_just_engaged = False
 
         # Auto-slice large PDFs into 150-page parts before conversion
         # (configurable threshold; opt-out via --no-auto-slice). The slice
@@ -627,12 +716,43 @@ def _run_batch(args, input_dir: Path, output_dir: Path, venv: Path) -> int:
                     ok, engine_used, quality_score, elapsed = _process_one_in_process(
                         pdf_path, output_dir, args, engines=in_process_engines)
             except CudaPoisonedError as exc:
-                ui.err(f"aborting batch: {exc}")
-                run_log_lines.append(
-                    f"{pdf_path.name}\tABORTED\treason=cuda_poisoned: {exc}")
-                cuda_aborted = True
-                any_failed = True
-                break
+                if args.no_cpu_fallback:
+                    ui.err(f"aborting batch: {exc}")
+                    run_log_lines.append(
+                        f"{pdf_path.name}\tABORTED\treason=cuda_poisoned: {exc}")
+                    cuda_aborted = True
+                    any_failed = True
+                    break
+                # Engage CPU fallback and retry THIS PDF on CPU. Driver is
+                # in a dead state for GPU but the engines still run on CPU
+                # without touching it — the subprocess child sees no CUDA
+                # devices via CUDA_VISIBLE_DEVICES=-1.
+                ui.warn(f"GPU CUDA context poisoned: {exc}")
+                ui.warn(f"CPU fallback engaged, retrying {pdf_path.name} "
+                        f"and continuing the batch on CPU.")
+                cpu_fallback_active = True
+                args.cpu = True
+                _flip_engines_to_cpu(in_process_engines)
+                try:
+                    if batch_isolated:
+                        ok, engine_used, quality_score, elapsed = _process_one_subprocess(
+                            pdf_path, output_dir, args)
+                    else:
+                        ok, engine_used, quality_score, elapsed = _process_one_in_process(
+                            pdf_path, output_dir, args, engines=in_process_engines)
+                except CudaPoisonedError as exc2:
+                    # CPU retry still surfaced cuda_poisoned: either the
+                    # marker exporter dereferenced cuda inside its own
+                    # process despite CUDA_VISIBLE_DEVICES=-1 (rare; some
+                    # libs probe nvml independently), or the previous error
+                    # came back unchanged. Treat as a hard abort.
+                    ui.err(f"aborting batch: CPU retry also cuda_poisoned: {exc2}")
+                    run_log_lines.append(
+                        f"{pdf_path.name}\tABORTED\treason=cuda_poisoned "
+                        f"(after CPU retry): {exc2}")
+                    cuda_aborted = True
+                    any_failed = True
+                    break
 
         if ok:
             md_file = output_dir / pdf_path.stem / f"{pdf_path.stem}.md"
@@ -656,14 +776,62 @@ def _run_batch(args, input_dir: Path, output_dir: Path, venv: Path) -> int:
                             "engine": "", "elapsed": 0.0})
             any_failed = True
             # Subprocess path: cuda_poisoned shows up in the per-PDF
-            # debug.log reason. Detect and abort the same as the in-process
-            # path. This is what the next-PDF GPU probe would also catch,
-            # but bailing immediately saves the probe round-trip.
+            # debug.log reason. With --no-cpu-fallback this aborts the batch
+            # (pre-2026-05 behavior). Otherwise: engage CPU fallback, retry
+            # THIS PDF on CPU, then continue.
             if "cuda_poisoned" in reason or "cuda context poisoned" in reason.lower():
-                ui.err("aborting batch: GPU CUDA context poisoned, "
-                       "reboot required before retrying")
-                cuda_aborted = True
-                break
+                if args.no_cpu_fallback:
+                    ui.err("aborting batch: GPU CUDA context poisoned, "
+                           "reboot required before retrying")
+                    cuda_aborted = True
+                    break
+                ui.warn(f"GPU CUDA context poisoned on {pdf_path.name}.")
+                ui.warn(f"CPU fallback engaged, retrying {pdf_path.name} "
+                        f"and continuing the batch on CPU.")
+                cpu_fallback_active = True
+                args.cpu = True
+                _flip_engines_to_cpu(in_process_engines)
+                # The previous attempt left a partial stem dir + debug.log
+                # whose status=failed line we'd re-scrape. Wipe the .md so
+                # the cached-output check doesn't false-hit a stale file
+                # the next time around, but keep debug.log appended-to.
+                stale_md = output_dir / pdf_path.stem / f"{pdf_path.stem}.md"
+                try:
+                    stale_md.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                ok, engine_used, quality_score, elapsed = _process_one_subprocess(
+                    pdf_path, output_dir, args)
+                if ok:
+                    md_file = output_dir / pdf_path.stem / f"{pdf_path.stem}.md"
+                    md_text = md_file.read_text(encoding="utf-8", errors="replace")
+                    chunks = chunking.chunk(md_text, source=pdf_path.name,
+                                            engine=engine_used or "unknown",
+                                            quality_score=quality_score)
+                    all_chunks.extend(chunks)
+                    ui.ok(f"{len(chunks)} chunks via {engine_used} (CPU retry, "
+                          f"score {quality_score:.2f})")
+                    run_log_lines.append(
+                        f"{pdf_path.name}\tok\t{engine_used}\tcpu_retry\t"
+                        f"score={quality_score:.2f}\telapsed={elapsed:.1f}s")
+                    # Overwrite the prior failed summary entry.
+                    summary[-1] = {"name": pdf_path.name, "status": "ok",
+                                   "engine": engine_used + "+cpu", "elapsed": elapsed}
+                    # Reset any_failed only if this was the first failure;
+                    # other PDFs may have failed for non-CUDA reasons.
+                    any_failed = any(s["status"] == "failed" for s in summary)
+                else:
+                    retry_reason = _read_last_failure_reason(
+                        output_dir / pdf_path.stem / "debug.log")
+                    if ("cuda_poisoned" in retry_reason
+                            or "cuda context poisoned" in retry_reason.lower()):
+                        ui.err(f"aborting batch: CPU retry also "
+                               f"cuda_poisoned: {retry_reason}")
+                        cuda_aborted = True
+                        break
+                    ui.err(f"CPU retry failed: {retry_reason}")
+                print()
+                continue
             # F23: a per-PDF disk error escalates the batch's exit code so
             # a wrapping scheduler can distinguish "this PDF failed for
             # content reasons (try a different engine)" from "the host is
@@ -698,7 +866,8 @@ def _run_batch(args, input_dir: Path, output_dir: Path, venv: Path) -> int:
 
     # Aggregate summary to stdout (Phase-1 finding F14).
     _print_batch_summary(summary, time.time() - batch_t0,
-                         cuda_aborted=cuda_aborted)
+                         cuda_aborted=cuda_aborted,
+                         cpu_fallback_active=cpu_fallback_active)
 
     # Distinct exit codes let a wrapping batch script (or a future
     # scheduler) tell apart:
@@ -713,7 +882,8 @@ def _run_batch(args, input_dir: Path, output_dir: Path, venv: Path) -> int:
 
 
 def _print_batch_summary(summary: list[dict], total_elapsed: float,
-                         cuda_aborted: bool) -> None:
+                         cuda_aborted: bool,
+                         cpu_fallback_active: bool = False) -> None:
     """End-of-batch human-readable aggregate (Phase-1 finding F14)."""
     n_ok = sum(1 for s in summary if s["status"] == "ok")
     n_cached = sum(1 for s in summary if s["status"] == "cached")
@@ -731,6 +901,10 @@ def _print_batch_summary(summary: list[dict], total_elapsed: float,
         print(f"  failed: {', '.join(failed)}")
     if cuda_aborted:
         print(f"  {ui.YELLOW}cuda_aborted: reboot required before next run"
+              f"{ui.RESET}")
+    elif cpu_fallback_active:
+        print(f"  {ui.YELLOW}cpu_fallback: GPU was disabled mid-batch "
+              f"(driver poison or low VRAM). Reboot to restore GPU path."
               f"{ui.RESET}")
 
 

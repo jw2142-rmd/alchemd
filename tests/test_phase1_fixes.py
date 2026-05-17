@@ -119,6 +119,9 @@ def test_process_one_subprocess_sets_child_lock_env(monkeypatch, tmp_path):
         no_sanitize = False
         keep_temp = False
         force = False
+        cpu = False
+        no_cpu_fallback = False
+        vram_headroom_gib = 3.0
     pdf = tmp_path / "anything.pdf"
     pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
 

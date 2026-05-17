@@ -53,7 +53,8 @@ def _detect_cuda_available() -> bool:
 _cuda_available_cached = _detect_cuda_available()
 
 
-def adaptive_timeout(page_count: int | None, cap: int = DEFAULT_TIMEOUT_SEC) -> int:
+def adaptive_timeout(page_count: int | None, cap: int = DEFAULT_TIMEOUT_SEC,
+                     force_cpu: bool = False) -> int:
     """Compute a per-convert timeout: baseline + per-page * pages, capped.
 
     page_count=None falls back to the cap (legacy behaviour). The cap stays
@@ -62,11 +63,15 @@ def adaptive_timeout(page_count: int | None, cap: int = DEFAULT_TIMEOUT_SEC) -> 
 
     F21: when CUDA is not available, multiply by _CPU_TIMEOUT_MULTIPLIER so
     CPU-only hosts don't false-timeout marker on small documents.
+
+    force_cpu (set by cli when VRAM is low or a prior PDF poisoned the
+    driver) applies the same CPU multiplier even when torch.cuda is
+    technically available — the child won't be allowed to see the GPU.
     """
     if page_count is None or page_count <= 0:
         return cap
     base = _BASELINE_TIMEOUT_SEC + _PER_PAGE_TIMEOUT_SEC * page_count
-    if not _cuda_available_cached:
+    if force_cpu or not _cuda_available_cached:
         base *= _CPU_TIMEOUT_MULTIPLIER
     return min(base, cap)
 
@@ -131,9 +136,17 @@ _ENGINE_CUDA_ALLOC_CONF = "expandable_segments:True"
 class SubprocessEngine:
     """Runs any engine_runner-supported engine in its own interpreter."""
 
-    def __init__(self, name: str, timeout: int = DEFAULT_TIMEOUT_SEC) -> None:
+    def __init__(self, name: str, timeout: int = DEFAULT_TIMEOUT_SEC,
+                 force_cpu: bool = False) -> None:
         self.name = name
         self._timeout = timeout
+        # Public flag the cli can flip at runtime: after a cuda_poisoned
+        # detection (or a low-VRAM probe) the parent sets force_cpu=True on
+        # every engine instance for the remainder of the batch. Each new
+        # subprocess then runs with CUDA_VISIBLE_DEVICES=-1 — the engine
+        # never sees a GPU, the driver can't be poisoned further, and
+        # subsequent PDFs complete (slowly) on CPU instead of all failing.
+        self.force_cpu = force_cpu
 
     def convert(self, pdf: Path, out_dir: Path,
                 page_count: int | None = None) -> EngineResult:
@@ -147,7 +160,8 @@ class SubprocessEngine:
         os.close(fd)
         result_path = Path(result_path_str)
 
-        timeout = adaptive_timeout(page_count, cap=self._timeout)
+        timeout = adaptive_timeout(page_count, cap=self._timeout,
+                                   force_cpu=self.force_cpu)
 
         try:
             cmd = [
@@ -160,6 +174,12 @@ class SubprocessEngine:
             # still wins (some users set their own alloc config).
             child_env = os.environ.copy()
             child_env.setdefault("PYTORCH_CUDA_ALLOC_CONF", _ENGINE_CUDA_ALLOC_CONF)
+            if self.force_cpu:
+                # Hide every CUDA device from the child. torch.cuda.is_available()
+                # returns False, every engine downgrades to CPU automatically.
+                # Overrides any inherited value — a parent that already had
+                # CUDA_VISIBLE_DEVICES=0 must still produce a CPU child here.
+                child_env["CUDA_VISIBLE_DEVICES"] = "-1"
             try:
                 proc = subprocess.run(cmd, capture_output=True,
                                       timeout=timeout, env=child_env)

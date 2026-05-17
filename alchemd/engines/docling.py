@@ -6,11 +6,14 @@ from pathlib import Path
 
 from alchemd.engines.base import EngineError, EngineResult
 
-# All batch sizes pinned to 1 so layout / OCR / table inference run one
-# page at a time on a single CUDA stream. Defaults are 4/4/4 with
-# num_threads=4, which fragments VRAM on table-heavy PDFs and triggers
-# `CUDA error: out of memory` even with >13 GiB free (allocator
-# fragmentation, not exhaustion). See 2026-04-29 poisoning incident.
+# Docling is pinned to CPU. Even with batch sizes of 1 (down from defaults
+# 4/4/4) docling continued to fragment VRAM on heavy art / large books and
+# poison the driver — Witchlight (2026-05-17) and the 2026-04-29 incident
+# were both docling-side `CUDA error: unknown / out of memory` despite
+# >13 GiB free. Running docling on CPU eliminates the entire fragmentation
+# class. Marker keeps GPU. CPU docling is slower (~3-5x on table-heavy
+# books) but never poisons the driver, and the adaptive subprocess
+# timeout already auto-scales 6x when CUDA_VISIBLE_DEVICES=-1.
 DOCLING_LAYOUT_BATCH = 1
 DOCLING_OCR_BATCH = 1
 DOCLING_TABLE_BATCH = 1
@@ -36,7 +39,7 @@ class DoclingEngine:
             opts = PdfPipelineOptions(
                 accelerator_options=AcceleratorOptions(
                     num_threads=DOCLING_NUM_THREADS,
-                    device=AcceleratorDevice.AUTO,
+                    device=AcceleratorDevice.CPU,
                 ),
                 ocr_batch_size=DOCLING_OCR_BATCH,
                 layout_batch_size=DOCLING_LAYOUT_BATCH,
