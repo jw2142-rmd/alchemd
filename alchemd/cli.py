@@ -290,7 +290,9 @@ def _decide_override(engine: str):
         return None
     def _fn(profile, cfg=None):
         return [engine]
-    return _fn
+    def _fn_with_reason(profile, cfg=None):
+        return [engine], f"forced by --engine {engine}"
+    return _fn, _fn_with_reason
 
 
 class CudaPoisonedError(RuntimeError):
@@ -330,11 +332,14 @@ def _process_one_in_process(pdf_path: Path, output_dir: Path, args,
     as CudaPoisonedError so the cli main loop can abort the batch."""
     if engines is None:
         engines = _build_engines()
-    override_decide = _decide_override(args.engine)
+    overrides = _decide_override(args.engine)
 
     original_decide = router.decide
-    if override_decide is not None:
+    original_decide_with_reason = router.decide_with_reason
+    if overrides is not None:
+        override_decide, override_decide_with_reason = overrides
         router.decide = override_decide  # type: ignore[assignment]
+        router.decide_with_reason = override_decide_with_reason  # type: ignore[assignment]
     try:
         try:
             r = driver.process_one(pdf_path, output_dir, engines=engines,
@@ -345,6 +350,7 @@ def _process_one_in_process(pdf_path: Path, output_dir: Path, args,
             raise
     finally:
         router.decide = original_decide  # type: ignore[assignment]
+        router.decide_with_reason = original_decide_with_reason  # type: ignore[assignment]
     return (r.ok, r.engine_used or "", r.quality_score or 0.0, r.elapsed)
 
 
