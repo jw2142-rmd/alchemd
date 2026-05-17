@@ -42,6 +42,12 @@ def _page_count(pdf: Path) -> int:
 def _is_encrypted(pdf: Path) -> bool:
     try:
         import pikepdf
+    except ImportError as exc:
+        raise RuntimeError(
+            "pikepdf is required for preflight encryption probe "
+            "but is not installed. Run: pip install pikepdf"
+        ) from exc
+    try:
         with pikepdf.open(str(pdf)) as _:
             return False
     except pikepdf.PasswordError:

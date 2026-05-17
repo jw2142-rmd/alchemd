@@ -113,22 +113,47 @@ def check(venv: Path, auto_yes: bool) -> None:
         ui.err("torch not found -- install into the venv before continuing.")
         sys.exit(1)
 
-    for pkg in ("marker", "docling", "mineru"):
+    # (import_name, pypi_name, optional)
+    # pypi_name differs from import_name for marker (marker-pdf) and is the
+    # exact string the user must paste into `pip install`. Recommendation 1.3
+    # of recommendations.md: misleading `pip install marker` guidance pointed
+    # at an unrelated PyPI package.
+    required_pkgs = (
+        ("marker", "marker-pdf", False),
+        ("docling", "docling", False),
+        ("pikepdf", "pikepdf", False),
+        ("pypdfium2", "pypdfium2", False),
+        ("pdfplumber", "pdfplumber", False),
+        ("pypdf", "pypdf", False),
+        ("mineru", "mineru", True),
+    )
+    missing_required: list[str] = []
+    for import_name, pypi_name, optional in required_pkgs:
         try:
-            __import__(pkg)
+            __import__(import_name)
         except ImportError:
-            ui.err(f"{pkg} not importable -- pip install {pkg}")
-            sys.exit(1)
+            if optional:
+                ui.warn(f"{import_name} not installed (optional) -- "
+                        f"pip install {pypi_name}")
+                continue
+            ui.err(f"{import_name} not importable -- "
+                   f"pip install {pypi_name}")
+            missing_required.append(pypi_name)
+            continue
         # mineru is invoked via its CLI, not its Python API. Importable
         # without a PATH entry means the Python package is installed but
         # the console script isn't — the engine will fail at resolve and
         # the engine registry will drop it.
-        if pkg == "mineru" and shutil.which("mineru") is None:
+        if import_name == "mineru" and shutil.which("mineru") is None:
             ui.warn("mineru importable but CLI not on PATH -- engine disabled "
                     "(activate the venv that exposes the mineru console script "
                     "to enable scanned-PDF fallback).")
         else:
-            ui.ok(f"{pkg} found.")
+            ui.ok(f"{import_name} found.")
+    if missing_required:
+        ui.err(f"install missing deps then re-run: "
+               f"pip install {' '.join(missing_required)}")
+        sys.exit(1)
 
     gs = find_ghostscript()
     if gs:

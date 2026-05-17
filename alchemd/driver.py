@@ -130,6 +130,8 @@ def process_one(pdf: Path, output_dir: Path, engines: dict[str, object],
     except Exception as exc:
         log.write(f"preflight failed: {exc}")
         log.write(traceback.format_exc())
+        log.section("done")
+        log.write(f"status=failed reason=preflight: {exc}")
         log.flush()
         if is_temp and work_path != pdf:
             try:
